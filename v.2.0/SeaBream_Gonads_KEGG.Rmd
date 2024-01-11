@@ -1,0 +1,399 @@
+---
+title: "SeaBream_Gonads_KEGG"
+author: "Camille Bordes"
+date: "2024-01-11"
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE, echo=FALSE}
+set.seed(927)
+x <- c("openxlsx", "dplyr", "tidyverse", "tximport", "preprocessCore", "impute",  # data manipulation
+       "BiocManager", "AnnotationHub", "AnnotationDbi", "biomaRt", "ensembldb", "GO.db",           # gene annotation
+       "RColorBrewer", "ggplot2", "ggrepel", "enrichplot", "pheatmap", "treemap", # data visualization
+       "DESeq2", "edgeR", "limma", "pathview", "WGCNA", "drlib",
+       "DOSE", "clusterProfiler", "GOstats", "gProfileR", "gage", "gageData")
+lapply(x, require, character.only = TRUE)
+
+#library(gageData)
+#library(org.Dr.eg.db)
+```
+
+
+##### Data import #####
+```{r, message=FALSE, warning=FALSE}
+data0 <- getwd() %>%                              # get the working directory
+  dirname() %>%                                   # move back to parent folder
+  paste0("/data/For network_camille.xlsx") %>%    # get into data, and get right file
+  openxlsx::read.xlsx(sheet = 1, startRow = 1)    # open the file
+
+data <- data0 %>%
+  textshape::column_to_rownames(loc = 1) %>%
+  dplyr::select(c(1:18))
+
+meta <- expand_grid(c(1:6), c(1:3)) %>% as.data.frame()
+meta <- meta[order(meta$Var1),]
+colnames(meta)  <- c("stage", "replicates")
+rownames(meta)  <- paste(meta$stage, meta$replicates, sep = "_")
+meta$replicates <- as.factor(meta$replicates)
+```
+#####
+
+
+##### DEG Analysis #####
+```{r, warning=FALSE, message=FALSE}
+data <- round(data)
+dds  <- DESeqDataSetFromMatrix(countData = data, 
+                               colData = meta, 
+                               design = ~ stage)
+dds  <- estimateSizeFactors(dds)
+normalized_counts <- counts(dds, normalized = TRUE)
+
+y <- DGEList(counts = data, samples = meta, design = model.matrix(~stage, data = meta))
+y <- calcNormFactors(y)
+y <- edgeR::estimateDisp.DGEList(y, robust=TRUE)
+#plotBCV(y)
+```
+
+```{r, warning=FALSE, message=FALSE}
+dds <- DESeqDataSetFromMatrix(
+  countData = data, 
+  colData   = meta, 
+  design    = ~ stage)
+dds   <- DESeq(dds, test = "LRT", reduced = ~1)
+resTC <- results(dds, alpha = 0.05, cooksCutoff=FALSE)
+resTC$symbol <- mcols(dds)$symbol
+res_shrunken <- lfcShrink(dds, 
+  coef = "stage", 
+  res  = resTC, 
+  type = "normal")
+
+res <- dds %>% results(alpha = 0.05) %>% summary()
+```
+#####
+
+
+##### Gene Annotations ##### --REQUIRE INTERNET CONNECTION
+```{r}
+datsets    <- listDatasets(mart = useMart(biomart = "ensembl"))
+ensembl    <- useEnsembl(biomart = "ensembl", dataset = "saurata_gene_ensembl") #version "fSpaAur1.1"
+attributes <- listAttributes(ensembl)
+filters    <- listFilters(ensembl)
+
+genes <- plyr::rbind.fill(
+  getBM(attributes = c("ensembl_gene_id", "ensembl_transcript_id", "go_id",
+                        "hgnc_symbol", "hgnc_id", "entrezgene_id", "external_gene_name", "description"),
+        filters    = "ensembl_gene_id",
+        values     = data0$Id,
+        mart       = ensembl),
+  getBM(attributes = c("ensembl_gene_id", "ensembl_transcript_id", "go_id",
+                       "hgnc_symbol", "hgnc_id", "entrezgene_id", "external_gene_name", "description"),
+        filters    = "external_gene_name",
+        values     = data0$`DEG.with.>2000.total.reads`,
+        mart       = ensembl),
+  getBM(attributes = c("ensembl_gene_id", "ensembl_transcript_id", "go_id",
+                       "hgnc_symbol", "hgnc_id", "entrezgene_id", "external_gene_name", "description"),
+        filters    = "hgnc_symbol",
+        values     = data0$`DEG.with.>2000.total.reads`,
+        mart       = ensembl)) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(
+    source = stringr::str_extract(description, "(?<=Source:)[A-Z]{4}"),
+    ACCNUM = stringr::str_extract(description, "(?<=Acc:)[[:alnum:][-]]*"),
+    desc.g = stringr::str_extract(description, ".*(?= [:punct:])"))
+```
+
+Keep annotations for our genes of interest
+```{r}
+res_shrunken <- res_shrunken %>% 
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "gene") %>%
+  dplyr::mutate(geneName = data0$`DEG.with.>2000.total.reads`[match(gene, data0$Id)])
+res_shrunken$geneName[res_shrunken$geneName=="0"] <- NA
+
+padj.cutoff <- 0.05
+lfc.cutoff  <- 0.58 # log2(1.5) = 0.5849625
+idx <- (genes$ensembl_gene_id %in% res_shrunken$gene)
+ids <- genes[idx, ]
+ids <- ids[which(duplicated(ids) == FALSE),]
+
+res_ids <- res_shrunken %>% as.data.frame() %>% inner_join(ids, by = c("gene" = "ensembl_gene_id"))
+mis_gen <- setdiff(res_ids$gene, res_ids$gene[!is.na(res_ids$entrezgene_id)])
+
+res_ids$initial_desc <- data0$X20[match(res_ids$gene, data0$Id)]
+lls <- which(res_ids$description != res_ids$initial_desc)
+mis <- unique(res_ids[lls, c("description", "initial_desc")])
+
+sig.g <- res_ids %>% dplyr::filter(padj < padj.cutoff & abs(log2FoldChange) > lfc.cutoff)
+lls <- match(as.character(sig.g$gene), res_ids$gene)
+all_genes <- unique(res_ids$entrezgene_id)
+sig_genes <- unique(res_ids$entrezgene_id[lls])
+sig_up    <- unique(res_ids$entrezgene_id[intersect(lls, which(res_ids$log2FoldChange>0))])
+sig_do    <- unique(res_ids$entrezgene_id[intersect(lls, which(res_ids$log2FoldChange<0))])
+```
+
+
+##### Enrichment Analysis (clusterProfiler) #####
+Universal enrichment analysis - User defined annotations (example with GO terms)
+```{r}
+geneList  <- setNames(sig.g$log2FoldChange, sig.g$entrezgene_id)
+TERM2GENE <- data.frame(TERM = genes$go_id, GENE = genes$entrezgene_id)
+TERM2NAME <- data.frame(TERM = genes$go_id, NAME = genes$external_gene_name)
+
+ego <- enricher(gene  = names(geneList), 
+         TERM2GENE    = TERM2GENE, 
+         TERM2NAME    = TERM2NAME, 
+         minGSSize    = 1, 
+         pvalueCutoff = 0.05,
+         qvalueCutoff = 0.1)
+
+if (sum(ego@result$p.adjust<=0.05) > 0) {
+  
+  dotplot(ego)
+  cnt_enrichment <- cnetplot(ego, 
+                             categorySize = "padj", 
+                             color.params = list(foldChange = sig.g$log2FoldChange))
+  #cnt_enrichment$data$color <- moduleMembership$Module[match(cnt_enrichment$data$gene, moduleMembership$GeneId)]
+  cnt_enrichment$data$gene <- sig.g$geneName[match(cnt_enrichment$data$name, sig.g$entrezgene_id)]
+  cnt_enrichment$data$name[!is.na(cnt_enrichment$data$gene)] <- cnt_enrichment$data$gene[!is.na(cnt_enrichment$data$gene)]
+  cnt_enrichment
+  
+  #ggplot2::ggplot_build(cnt_enrichment)$data[[4]]$label <- cnt_enrichment$data$name
+  
+  significant_results <- ego@result %>% subset(p.adjust < 0.05)
+  
+} else {
+  
+  print("No enriched terms.")
+  
+}
+```
+
+KEGG enrichment analysis - User defined annotations (example with GO terms)
+```{r}
+pnam <- AnnotationDbi::select(GO.db, 
+                              keys    = unique(genes$go_id),
+                              keytype = "GOID",
+                              columns = c("TERM","ONTOLOGY"))
+
+enrichedUP <- limma::kegga(
+    de            = as.vector.data.frame(res_shrunken$gene[res_shrunken$log2FoldChange>0 & res_shrunken$padj<0.05]), 
+    universe      = as.vector.data.frame(genes$ensembl_gene_id), 
+    gene.pathway  = genes[,c("ensembl_gene_id", "go_id")], 
+    pathway.names = pnam) %>%
+  dplyr::filter(P.DE <= 0.05)
+
+enrichedDOWN <- limma::kegga(
+    de            = as.vector.data.frame(res_shrunken$gene[res_shrunken$log2FoldChange<0 & res_shrunken$padj<0.05]), 
+    universe      = as.vector.data.frame(genes$ensembl_gene_id), 
+    gene.pathway  = genes[,c("ensembl_gene_id", "go_id")], 
+    pathway.names = pnam) %>%
+  dplyr::filter(P.DE <= 0.05)
+```
+
+
+KEGG enrichment analysis - User defined annotations (example with KEGG terms)
+1. ID a relevant KEGG-supported organism that is homologous to Sea bream
+```{r, fig.height=10}
+l.Orgs <- listOrganisms()
+sp.key <- listDatasets(useEnsembl(biomart = "ensembl")) %>%
+  dplyr::mutate(species_code = stringr::str_extract(dataset, "[a-z]*(?=_gene)"),
+                species_vern = stringr::str_extract(description, ".*(?= genes)"),
+                species_name = l.Orgs$organism[match(tolower(species_vern), l.Orgs$commonName)])
+
+homolog_species <- ensembl@attributes %>%
+  dplyr::select(name, description, fullDescription, page) %>%
+  dplyr::filter(stringr::str_detect(name, "homolog")) %>%
+  dplyr::mutate(hom_species = str_split(name, "_", simplify = TRUE)[, 1]) %>%
+  dplyr::select(hom_species) %>%
+  dplyr::distinct() %>%
+  as.vector()
+  
+homolog_datasets <- filters %>%
+  dplyr::filter(!is.na(str_extract(name, "homolog"))) %>%
+  dplyr::select(name) %>%
+  as.vector()
+
+i <- 1
+homolog_genes <- matrix(0, 
+  nrow = length(unique(genes$ensembl_gene_id)), 
+  ncol = length(homolog_species$hom_species),
+  dimnames = list(unique(genes$ensembl_gene_id),
+                  homolog_species$hom_species)) %>% as.data.frame()
+for (hd in homolog_datasets$name) {
+  
+  sp      <- stringr::str_extract(hd, "(?<=with_)[a-z]*(?=_homolog)")
+  full_sp <- sp.key$species_name[match(sp, sp.key$species_code)]
+  checksp <- clusterProfiler::search_kegg_organism(full_sp, by = "scientific_name")
+  in.kegg <- nrow(checksp)>0
+  
+  if (in.kegg & !is.na(full_sp)) {
+    
+    homo.g <- getBM(attributes = c("ensembl_gene_id", paste0(sp, "_homolog_orthology_confidence")), 
+                    filters    = hd, 
+                    mart       = ensembl, 
+                    values     = TRUE) %>%
+      dplyr::rename(ensembl_gene_id = 1, orthology_confidence = 2) %>%
+      dplyr::group_by(ensembl_gene_id) %>%
+      dplyr::mutate(orthology_confidence = mean(orthology_confidence, na.rm = TRUE)) %>%
+      dplyr::ungroup() %>%
+      dplyr::distinct() %>%
+      dplyr::filter(ensembl_gene_id %in% rownames(homolog_genes))
+    
+    rw <- match(homo.g$ensembl_gene_id, rownames(homolog_genes))
+    cl <- match(sp, colnames(homolog_genes))
+    homolog_genes[rw,cl] <- homo.g$orthology_confidence + 0.5
+    
+  }
+  
+  print(paste0("Processed species ", i, " out of ", length(homolog_datasets$name)))
+  i <- i + 1
+  
+}
+
+names.row <- genes$external_gene_name[match(rownames(homolog_genes), genes$ensembl_gene_id)]
+#to.remove <- which(names.row=="")
+#homolog_genes <- homolog_genes[-to.remove,]
+#names.row <- names.row[-to.remove]
+rownames(homolog_genes) <- make.names(names.row, unique = TRUE)
+
+hist.dat <- homolog_genes %>% 
+  t() %>% as.data.frame() %>%
+  dplyr::mutate(perc.orth = signif(100*(rowSums(.>0.5, na.rm = TRUE)/nrow(homolog_genes)), 2)) %>%
+  tibble::rownames_to_column(var = "sp_code") %>%
+  dplyr::mutate(species = sp.key$species_name[match(sp_code, sp.key$species_code)],
+                named   = as.numeric(!is.na(species))) %>%
+  dplyr::arrange(desc(perc.orth)) %>%
+  dplyr::slice_head(n = 25)
+hist.dat$species[is.na(hist.dat$species)] <- hist.dat$sp_code[is.na(hist.dat$species)]
+hist.dat$named <- hist.dat$named + 1
+
+# phyllum > class > order > family > genus > species
+target.sp <- hist.dat$species
+finish.sp <- c()
+hist.dat$class <- NA
+while(length(target.sp) != 0) {
+  
+  spe <- match(target.sp[1], hist.dat$species)
+  try(
+    hist.dat$class[spe] <- taxize::tax_name(
+      sci = target.sp[1], 
+      get = "family", 
+      db  = "ncbi")$family
+  )
+  if (!is.na(hist.dat$class[spe])) {
+    finish.sp <- c(finish.sp, target.sp[1])
+    target.sp <- target.sp[-1]
+  }
+  
+}
+
+min.y <- min(hist.dat$perc.orth) - IQR(hist.dat$perc.orth)
+max.y <- max(hist.dat$perc.orth) + IQR(hist.dat$perc.orth)
+
+a <- ggplot(hist.dat,
+       aes(x = reorder(species, -perc.orth),
+           y = perc.orth,
+           fill = class)) +
+  geom_bar(stat = "identity")  +
+  scale_fill_viridis_d(na.value = "grey75",
+                       name = "Family") +
+  coord_cartesian(ylim = c(min.y, max.y)) + 
+  ggpubr::theme_pubclean() +
+  ylab("% orthologous genes") +
+  xlab("") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks = element_blank())
+
+highlight.g <- sample(rownames(homolog_genes), 5)
+hist.high   <- hist.dat %>%
+  dplyr::select(any_of(highlight.g), species, perc.orth, class) %>%
+  tidyr::pivot_longer(cols = c(1:5),
+                      names_to = "genes", 
+                      values_to = "orthologous")
+b <- ggplot(hist.high,
+       aes(x = reorder(species, -perc.orth),
+           y = genes,
+           color = ifelse(orthologous==0, NA, class))) +
+  geom_point(aes(size  = orthologous==0,
+                 alpha = orthologous)) +
+  scale_color_viridis_d(na.value = "grey75") +
+  scale_size_manual(values = c(3,2)) +
+  ggpubr::theme_pubr() +
+  ylab("") + xlab("") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.ticks = element_blank(),
+        axis.line  = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = "none")
+
+a + b + patchwork::guide_area() + 
+  patchwork::plot_layout(ncol = 1, 
+                         nrow = 3, 
+                         heights = c(3,1),
+                        guides  = "collect")
+```
+
+2. Map orthologous genes from Sea Bream to Danio rerio (KEGG-supported) + get ENTREZID for Danio rerio
+```{r}
+saurata_drerio_key <- getBM(
+  attributes = c("drerio_homolog_ensembl_gene", "ensembl_gene_id"), 
+  filters    = "with_drerio_homolog", 
+  mart       = ensembl, 
+  values     = TRUE) %>%
+  dplyr::filter(ensembl_gene_id %in% res_shrunken$gene) %>%
+  dplyr::mutate(l2fc = res_shrunken$log2FoldChange[match(ensembl_gene_id, res_shrunken$gene)],
+                pval = res_shrunken$padj[match(ensembl_gene_id, res_shrunken$gene)])
+
+mart_dre <- biomaRt::useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                             dataset = "drerio_gene_ensembl")
+
+gene_dre <- getBM(filters    = "ensembl_gene_id",
+                  attributes = c("ensembl_gene_id", "entrezgene_id"),
+                  values     = saurata_drerio_key$drerio_homolog_ensembl_gene,
+                  mart       = mart_dre) %>%
+  dplyr::mutate(l2fc = saurata_drerio_key$l2fc[match(ensembl_gene_id, saurata_drerio_key$drerio_homolog_ensembl_gene)],
+                pval = saurata_drerio_key$pval[match(ensembl_gene_id, saurata_drerio_key$drerio_homolog_ensembl_gene)])
+```
+
+3. Perform KEGG enrichment analysis
+```{r}
+kegg <- enrichKEGG(gene         = gene_dre$entrezgene_id, 
+                   organism     = 'dre', 
+                   keyType      = "kegg", 
+                   pvalueCutoff = 0.05)
+dotplot(kegg)
+pts <- pairwise_termsim(kegg)
+emapplot(pts)
+cnetplot(kegg, 
+         layout            = "fr",
+         categorySize      = "pvalue", 
+         foldChange        = setNames(gene_dre$l2fc, gene_dre$entrezgene_id), 
+         vertex.label.font = 6)
+
+kegg_drerio <- kegg.gsets(species = "dre", id.type = "kegg")
+kegg.gs     <- kegg_drerio$kg.sets[kegg_drerio$sigmet.idx]
+foldchanges <- setNames(gene_dre$l2fc, gene_dre$entrezgene_id)
+keggres     <- gage(foldchanges, gsets = kegg.gs, same.dir = T)
+
+head(keggres$greater) #Pathways that are up-regulated
+head(keggres$less)    #Pathways that are down-regulated
+
+sel_up      <- keggres$greater[, "q.val"] < 0.05 & !is.na(keggres$greater[, "q.val"])
+path_ids_up <- rownames(keggres$greater)[sel_up]
+keggresids  <- substr(path_ids_up, start = 1, stop = 8)
+kegg.dir <- getwd() %>% dirname() %>% paste0("/outputs/KEGG_pathways")
+
+pathview(gene.data  = foldchanges, 
+         pathway.id = keggresids, 
+         species    = "dre",
+         kegg.native = TRUE,
+         same.layer  = FALSE,
+         kegg.dir    = kegg.dir)
+```
+
+
+# Gene set Enrichment Analysis enrichment analysis
+```{r}
+GSEA()
+```
+#####
