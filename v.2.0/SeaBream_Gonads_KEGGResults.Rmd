@@ -1,0 +1,1224 @@
+---
+title: "SeaBream_Gonads_KeggResults"
+author: "Camille Bordes, bordescamille@duck.com"
+date: "version `r format(Sys.time(), '%B %d, %Y')`"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE, message=FALSE, echo=FALSE}
+#library(gageData)
+#library(org.Dr.eg.db)
+# devtools::install_github('kevinblighe/EnhancedVolcano')
+# devtools::install_github("yanlinlin82/ggvenn")
+# remotes::install_github("ccsosa/GOCompare")
+
+set.seed(927)
+x <- c("openxlsx", "dplyr", "tidyverse", "tximport", "preprocessCore", "impute",         # data manipulation
+       "BiocManager", "AnnotationHub", "AnnotationDbi", "biomaRt", "ensembldb", "GO.db", # gene annotation
+       "RColorBrewer", "ggplot2", "ggrepel", "enrichplot", "pheatmap", "treemap",        # data visualization
+       "DESeq2", "edgeR", "limma", "pathview", "WGCNA", "drlib", "igraph",
+       "DOSE", "clusterProfiler", "GOstats", "gProfileR", "gage", "gageData")
+lapply(x, require, character.only = TRUE)
+
+
+fisher <- function(p_values) {
+  z <- -2 * sum(log(p_values))
+  p <- 1 - pchisq(z, df = 2 * length(p_values))
+  return(p)
+}
+
+get_scientific_name <- function(Organism) {
+  Name <- Organism %>% 
+    str_to_title() %>% 
+    strsplit(., "_") %>% 
+    unlist() %>% 
+    paste(collapse = " ")
+  return(Name)
+}
+
+genes <- getwd() %>%
+  dirname() %>%
+  paste0(., "/data/seaBream_genes_ensembl.rds") %>%
+  readRDS()
+
+DEGs <- getwd() %>%
+  dirname() %>%
+  paste0(., "/data/seaBream_genes_DESeq2_l2fc_0.rds") %>%
+  readRDS()
+
+hist.dat <- getwd() %>% 
+  dirname() %>% 
+  paste0(., "/data/homolog_genes_histogramFormatted.rds") %>% 
+  readRDS()
+
+homolog_genes1 <- getwd() %>% 
+  dirname() %>% 
+  paste0(., "/data/homolog_genes_quality.rds") %>% 
+  readRDS()
+
+homolog_genes2 <- getwd() %>% 
+  dirname() %>% 
+  paste0(., "/data/homolog_species_quality.rds") %>% 
+  readRDS()
+names.row <- genes$external_gene_name[match(rownames(homolog_genes2), genes$ensembl_gene_id)]
+rownames(homolog_genes2) <- make.names(names.row, unique = TRUE)
+
+modules <- getwd() %>%
+  dirname() %>%
+  paste0(., "/data/seaBream_coExpressionModules_l2fc_058.rds") %>%
+  readRDS()
+
+#k.o <- get_multiSpecies_keggAnnotations()
+k.o <- getwd() %>% 
+  dirname() %>% 
+  paste0("/data/Multispecies_KEGG_annotations_new.rds") %>%
+  readRDS() %>% 
+  dplyr::filter(!is.na(KEGG_Pathway_name)) %>%
+  dplyr::distinct(source_geneID,
+                  source_geneName, 
+                  source_Description,
+                  DEG_log2_FC, 
+                  DEG_p_value, 
+                  KEGG_Pathway_name,
+                  .keep_all = TRUE)
+
+KO_annot <- getwd() %>%
+  dirname() %>%
+  paste0("/data/KO_annot.rds") %>%
+  readRDS()
+
+TOM <- getwd() %>% 
+  dirname() %>% 
+  paste0(., "/data/seaBream_WGCNA_TOM_matrix_l2fc_0.rds") %>% 
+  readRDS()
+
+padj.cutoff <- 0.05
+lfc.cutoff  <- 0.25
+ensembl <- useEnsembl(biomart = "ensembl", dataset = "saurata_gene_ensembl") #version "fSpaAur1.1"
+l.Orgs  <- listOrganisms()
+sp.key  <- listDatasets(useEnsembl(biomart = "ensembl")) %>%
+  dplyr::mutate(species_code = stringr::str_extract(dataset, "[a-z]*(?=_gene)"),
+                species_vern = stringr::str_extract(description, ".*(?= genes)"),
+                species_name = l.Orgs$organism[match(tolower(species_vern), l.Orgs$commonName)]) %>%
+  dplyr::mutate(species_name = ifelse(species_vern=="Nile tilapia", "Oreochromis niloticus", species_name))
+```
+ 
+The guilt head sea bream (Sparus aurata) is not supported by the KEGG library meaning it is not possible to annotate differentially expressed genes to identify up or down-regulated pathways. We must find a KEGG-supported organism which shares enough homologous genes with Sparus aurata so we can map its genes onto our study species. Most commonly used KEGG-supported organisms is Danio rerio, hence we try to map Sparus aurata genes onto its genome and perform a first KEGG analysis as is.
+ 
+ 
+ 
+## 1. Classic appraoch: KEGG analysis on Danio rerio {.tabset}
+ 
+### clusterProfiler analysis
+```{r, include = FALSE, message = FALSE, warning = FALSE, echo=FALSE}
+# Prepare for the KEGG enrichment analysis
+sp <- "drerio"
+assign(x = paste0("saurata_", sp, "_key"),
+      value = getBM(attributes = c("ensembl_gene_id", 
+                                    paste0(sp, "_homolog_ensembl_gene"), 
+                                    paste0(sp, "_homolog_associated_gene_name"), 
+                                    paste0(sp, "_homolog_orthology_confidence"), 
+                                    paste0(sp, "_homolog_perc_id"), 
+                                    paste0(sp, "_homolog_goc_score")), 
+                    filters    = paste0("with_", sp, "_homolog"), 
+                    mart       = ensembl, 
+                    values     = TRUE) %>%
+        dplyr::rename_all(function(x) gsub(paste0("^[^_]*", sp, "_"), "", x)) %>%
+        dplyr::mutate(species = sp,
+                      l2fc = DEGs$log2FoldChange[match(ensembl_gene_id, DEGs$gene)],
+                      pval = DEGs$padj[match(ensembl_gene_id, DEGs$gene)]) %>%
+        dplyr::rowwise() %>%
+        dplyr::mutate(conf = mean(c(homolog_orthology_confidence*100, homolog_perc_id, homolog_goc_score), na.rm = TRUE)) %>%
+        dplyr::ungroup())
+  
+assign(x = paste0("mart_", sp),
+       value = biomaRt::useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                                dataset = paste0(sp, "_gene_ensembl")))
+  
+assign(x = paste0("gene_", sp),
+       value = getBM(filters    = "ensembl_gene_id",
+                     attributes = c("ensembl_gene_id", "entrezgene_id", "external_gene_name", "hgnc_symbol"),
+                     values     = get(paste0("saurata_", sp, "_key"))$homolog_ensembl_gene,
+                     mart       = get(paste0("mart_", sp))) %>%
+  dplyr::mutate(l2fc = get(paste0("saurata_", sp, "_key"))$l2fc[match(ensembl_gene_id, get(paste0("saurata_", sp, "_key"))$homolog_ensembl_gene)],
+                pval = get(paste0("saurata_", sp, "_key"))$pval[match(ensembl_gene_id, get(paste0("saurata_", sp, "_key"))$homolog_ensembl_gene)]))
+  
+  
+gene_kegg_org <- get(paste0("gene_", sp))
+org_kegg_code <- stringr::str_extract(sp, pattern = "[a-z]{3}")
+pattern_kegg  <- paste0("(?= [-] ", homolog_genes1$target_scientific_name[match(sp, homolog_genes1$target_species)], ").*")
+
+# KEGG analysis per se
+genes_enrich <- gene_kegg_org %>%
+  dplyr::filter(!is.na(l2fc), pval <= 0.05) %>%
+  dplyr::select(entrezgene_id)
+kegg <- enrichKEGG(gene         = genes_enrich$entrezgene_id,
+                   universe     = gene_kegg_org$entrezgene_id,
+                   organism     = org_kegg_code, 
+                   keyType      = "kegg", 
+                   pvalueCutoff = 0.05)
+
+# KEGG table
+median.FC.values <- vector(mode="list", nrow(kegg@result))
+combined.pvalues <- vector(mode="list", nrow(kegg@result))
+kegg.annotations <- strsplit(kegg@result$geneID, "/")
+for (DEGene in unique(gene_kegg_org$entrezgene_id[!is.na(gene_kegg_org$l2fc)])) {
+  indices <- kegg.annotations %>%
+    lapply(., function(x) DEGene %in% x) %>% 
+    unlist() %>% 
+    which()
+  log.FCs <- gene_kegg_org$l2fc[match(DEGene, gene_kegg_org$entrezgene_id)]
+  pvalues <- gene_kegg_org$pval[match(DEGene, gene_kegg_org$entrezgene_id)]
+  median.FC.values[indices] <- mapply("c", median.FC.values[indices], log.FCs, SIMPLIFY = FALSE) 
+  combined.pvalues[indices] <- mapply("c", combined.pvalues[indices], pvalues, SIMPLIFY = FALSE)
+}
+median.FC.values <- lapply(median.FC.values, median) %>% unlist()
+combined.pvalues <- lapply(combined.pvalues, fisher) %>% unlist()
+plot.kegg <- kegg@result %>%
+  tibble::rownames_to_column(var = "pathway") %>%
+  dplyr::select(-geneID) %>%
+  dplyr::mutate(
+    id      = stringr::str_remove(rownames(kegg@result), org_kegg_code),
+    log.FCs = median.FC.values,
+    p.genes = combined.pvalues,
+    name    = kegg_category$name[match(id, kegg_category$id)])
+plot.kegg$Description <- stringr::str_remove_all(plot.kegg$Description, pattern = pattern_kegg)
+```
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE, fig.width=8}
+sub.kegg <- plot.kegg %>% dplyr::filter(p.adjust<=0.05, !is.na(name))
+ggplot(sub.kegg,
+       aes(x = log.FCs,
+           y = reorder(name, log.FCs),
+           color = log.FCs,
+           size  = Count)) +
+  geom_point() +
+  scale_color_gradient2(
+    name = "log2(Fold change)",
+    low    = "green3", 
+    mid    = "lightyellow2", 
+    high   = "tomato",
+    midpoint = mean(sub.kegg$log.FCs)) +
+  scale_size(name = "DEG count") +
+  ggpubr::theme_cleveland() +
+  theme(panel.background = element_blank()) +
+  ggtitle("Enriched KEGG pathways") +
+  xlab("log2(Fold change)")
+```
+
+```{r, fig.width=10, message=FALSE, warning=FALSE, echo=FALSE, include =FALSE}
+### Pathway networks
+pts <- pairwise_termsim(kegg)
+pts@result$Description  <- stringr::str_remove_all(pts@result$Description,  pattern = pattern_kegg)
+rownames(pts@termsim)   <- stringr::str_remove_all(rownames(pts@termsim),   pattern = pattern_kegg)
+colnames(pts@termsim)   <- stringr::str_remove_all(colnames(pts@termsim),   pattern = pattern_kegg)
+kegg@result$Description <- stringr::str_remove_all(kegg@result$Description, pattern = pattern_kegg)
+
+emapplot(pts)
+```
+
+```{r, fig.width=10, message=FALSE, warning=FALSE, echo=FALSE, include=FALSE}
+### Pathway dendrograms
+treeplot(pts)
+```
+
+```{r, fig.width=10, message=FALSE, warning=FALSE, echo=FALSE, include=FALSE}
+### Pathway-genes networks
+DEG_org <- gene_kegg_org[!is.na(gene_kegg_org$l2fc),]
+ord.lfc <- order(-DEG_org$l2fc)
+ord.gen <- setNames(DEG_org$l2fc[ord.lfc], DEG_org$entrezgene_id[ord.lfc])
+
+cnetplot(kegg, 
+         layout            = "fr",
+         categorySize      = "pvalue", 
+         color.params      = list(foldChange = ord.gen),
+         vertex.label.font = 6,
+         node_label        = "category") +
+  scale_color_gradient2(name = 'log2FC', 
+                        low  = 'skyblue4', 
+                        high = 'tomato4')
+```
+*This figure presents the results of a KEGG enrichment analysis performed with the clusterProfiler package. It only shows significant KEGG pathways and ignores the others*
+ 
+### GAGE analysis
+```{r, message=FALSE, warning=FALSE, echo=FALSE, fig.width=10, fig.height=7}
+kegg_orgMap <- kegg.gsets(species = org_kegg_code, id.type = "kegg")
+kegg.gs     <- kegg_orgMap$kg.sets[kegg_orgMap$sigmet.idx]
+keggres     <- gage(ord.gen, gsets = kegg.gs, same.dir = T)
+
+kegg.terms <- rbind.data.frame(
+  keggres$greater %>% 
+    as.data.frame() %>%
+    tibble::rownames_to_column(var = "pathway") %>%
+    dplyr::filter(!is.na(p.geomean)) %>%
+    dplyr::mutate(direction = "up-regulated"),
+  keggres$less %>% 
+    as.data.frame() %>%
+    tibble::rownames_to_column(var = "pathway") %>%
+    dplyr::filter(!is.na(p.geomean)) %>%
+    dplyr::mutate(direction = "down-regulated")) %>%
+  dplyr::mutate(pathway_id = stringr::str_extract(pathway, pattern = "[a-z]{3}[0-9]{5}"),
+                pathway_name = stringr::str_remove(pathway, pattern = "[a-z]{3}[0-9]{5} ")) %>%
+  dplyr::group_by(pathway_id) %>%
+  dplyr::arrange(q.val) %>%
+  dplyr::filter(row_number() == 1) %>%
+  dplyr::ungroup()
+
+ggplot(kegg.terms,
+       aes(x = q.val,
+           y = reorder(pathway_name, stat.mean),
+           size = set.size,
+           color = stat.mean)) +
+  geom_vline(xintercept = 0.1, color = "darkred", lty = "dotted") +
+  geom_point() +
+  scale_size(name = "Gene-set size") +
+  scale_color_gradient2(name = "Gene-set level change",
+                        low = "skyblue2",
+                        high = "tomato3",
+                        mid = "lightyellow2",
+                        midpoint = median(kegg.terms$stat.mean)) +
+  ylab("") + xlab("Adjusted p-value (FDR)") +
+  ggthemes::theme_few()
+```
+*This figure presents the results of a KEGG enrichment analysis performed with the gage package. It shows all KEGG pathways, even the non-significant ones. Results should be very similar to what is presented before, but differences may occur due to differences in KEGG databases.*
+ 
+ 
+ 
+## 2. Find a better KEGG-supported organism
+ 
+The KEGG analysis on Danio rerio does not yield important results at this stage. This is likely the result of many differentially expressed genes in Guilthead sea bream not being mapped onto homologous genes in Zebrafish. Consequently, the KEGG enrichment analysis may yield both false positives and false negatives. I developed an algorithm to determine which KEGG-supported organism is the most suitable to use for performing a KEGG enrichment analysis on a non-model organism. First, I extracted all homologous genes known for Sparus aurata into other organisms. The search was performed using the up-to-date NCBI database. 
+ 
+Turns out, the KEGG-supported organism with the best homologous genes (on average) is Oryzias latipes so I re-ran a KEGG enrichment test, hoping it would yield better results than using Zebrafish KEGG annotations.
+ 
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=7}
+best_species <- homolog_genes1 %>%
+  dplyr::filter(orthology_confidence > 0) %>%
+  dplyr::group_by(target_scientific_name) %>%
+  dplyr::summarise(n_reliable_homologs = length(unique(source_geneID)),
+                   mean_sequence_similarity = mean(perc.id, na.rm = TRUE),
+                   mean_GOC_score = mean(goc_score, na.rm = TRUE),
+                   average_homolog_quality = mean(c(mean_sequence_similarity, mean_GOC_score), na.rm = TRUE)) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(scale_n = scale(n_reliable_homologs),
+                scale_perc = scale(mean_sequence_similarity),
+                scale_goc  = scale(mean_GOC_score)) %>%
+  dplyr::group_by(target_scientific_name) %>%
+  dplyr::mutate(species_score = sum(scale_n, scale_perc, scale_goc)) %>%
+  dplyr::ungroup() %>%
+  dplyr::arrange(desc(species_score)) %>%
+  dplyr::mutate(species_rank = row_number()) %>%
+  dplyr::select(target_scientific_name, 
+                n_reliable_homologs,
+                mean_sequence_similarity,
+                mean_GOC_score,
+                average_homolog_quality,
+                species_score,
+                species_rank)
+
+best_homologs <- homolog_genes1 %>%
+  dplyr::mutate(species_rank = best_species$species_rank[match(target_scientific_name, best_species$target_scientific_name)]) %>%
+  dplyr::filter(orthology_confidence > 0,
+                perc.id > 0.5, 
+                goc_score >0.6,
+                source_geneID %in% DEGs$gene) %>%
+  dplyr::group_by(source_geneID) %>%
+  dplyr::arrange(species_rank) %>%
+  dplyr::filter(row_number()==1) %>%
+  dplyr::ungroup()
+```
+ 
+```{r, echo=FALSE, message=FALSE, warning=FALSE, fig.width=10, fig.height=10}
+min.y <- min(hist.dat$perc.orth) - IQR(hist.dat$perc.orth)
+max.y <- max(hist.dat$perc.orth) + IQR(hist.dat$perc.orth)
+
+a <- ggplot(hist.dat,
+       aes(x = reorder(species, -perc.orth),
+           y = perc.orth/100,
+           fill = class)) +
+  geom_bar(stat = "identity")  +
+  scale_fill_viridis_d(na.value = "grey75",
+                       name = "Family") +
+  coord_cartesian(ylim = c(min.y/100, max.y/100)) + 
+  ggpubr::theme_pubclean() +
+  ylab("% homologous genes") +
+  xlab("") +
+  ggtitle("Species with most homologous genes shared with Sparus aurata") +
+  theme(axis.text.x = element_blank(),
+        axis.ticks = element_blank())
+
+highlight.g <- sample(rownames(homolog_genes2), 5)
+highlight.g <- c("ogdhb", "sox32", "ift52", "hsd17b12a", "lbh")
+hist.high   <- hist.dat %>%
+  dplyr::select(any_of(highlight.g), species, perc.orth, class) %>%
+  tidyr::pivot_longer(cols = c(1:5),
+                      names_to = "genes", 
+                      values_to = "homologous")
+b <- ggplot(hist.high,
+       aes(x = reorder(species, -perc.orth),
+           y = genes,
+           color = ifelse(homologous==0, NA, class))) +
+  geom_point(aes(size  = homologous==0,
+                 alpha = homologous)) +
+  scale_color_viridis_d(na.value = "grey75") +
+  scale_size_manual(values = c(3,2)) +
+  ggpubr::theme_pubr() +
+  ylab("") + xlab("") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.ticks = element_blank(),
+        axis.line  = element_blank(),
+        panel.grid = element_blank(),
+        legend.position = "none")
+
+a + b + patchwork::guide_area() + 
+  patchwork::plot_layout(ncol = 1, 
+                         nrow = 3, 
+                         heights = c(3,1),
+                        guides  = "collect")
+```
+*In this figure, we see the percentage of Sparus aurata genes finding at least one homolog/ortholog in other species. Below, I highlighted some genes of interest and check if they are present in each species where homologs were detected.*
+ 
+ 
+ 
+## 3. KEGG Analysis on Oryzias latipes {.tabset}
+ 
+Overall, KEGG enrichment test performed using Danio rerio or Oryzias latipes annotations agree. There is a general increase in pathways relating to energy production, cytoskeleton and ribosomal activity (expected in developing organs).
+ 
+### clusterProfiler analysis
+```{r, warning=FALSE, message=FALSE, echo=FALSE}
+sp      <- "olatipes"
+assign(x = paste0("saurata_", sp, "_key"),
+      value = getBM(attributes = c("ensembl_gene_id", 
+                                    paste0(sp, "_homolog_ensembl_gene"), 
+                                    paste0(sp, "_homolog_associated_gene_name"), 
+                                    paste0(sp, "_homolog_orthology_confidence"), 
+                                    paste0(sp, "_homolog_perc_id"), 
+                                    paste0(sp, "_homolog_goc_score")), 
+                    filters    = paste0("with_", sp, "_homolog"), 
+                    mart       = ensembl, 
+                    values     = TRUE) %>%
+        dplyr::rename_all(function(x) gsub(paste0("^[^_]*", sp, "_"), "", x)) %>%
+        dplyr::mutate(species = sp,
+                      l2fc    = DEGs$log2FoldChange[match(ensembl_gene_id, DEGs$gene)],
+                       pval   = DEGs$padj[match(ensembl_gene_id, DEGs$gene)]) %>%
+        dplyr::rowwise() %>%
+        dplyr::mutate(conf = mean(c(homolog_orthology_confidence*100, homolog_perc_id, homolog_goc_score), na.rm = TRUE)) %>%
+        dplyr::ungroup())
+  
+assign(x = paste0("mart_", sp),
+       value = biomaRt::useMart(biomart = "ENSEMBL_MART_ENSEMBL",
+                                dataset = paste0(sp, "_gene_ensembl")))
+  
+assign(x = paste0("gene_", sp),
+       value = getBM(filters    = "ensembl_gene_id",
+                     attributes = c("ensembl_gene_id", "entrezgene_id", "external_gene_name", "hgnc_symbol"),
+                     values     = get(paste0("saurata_", sp, "_key"))$homolog_ensembl_gene,
+                     mart       = get(paste0("mart_", sp))) %>%
+  dplyr::mutate(l2fc = get(paste0("saurata_", sp, "_key"))$l2fc[match(ensembl_gene_id, get(paste0("saurata_", sp, "_key"))$homolog_ensembl_gene)],
+                pval = get(paste0("saurata_", sp, "_key"))$pval[match(ensembl_gene_id, get(paste0("saurata_", sp, "_key"))$homolog_ensembl_gene)]))
+  
+  
+gene_kegg_org <- get(paste0("gene_", sp))
+org_kegg_code <- stringr::str_extract(sp, pattern = "[a-z]{3}")
+pattern_kegg  <- paste0("(?= [-] ", homolog_genes1$target_scientific_name[match(sp, homolog_genes1$target_species)], ").*")
+
+
+# KEGG analysis per se
+genes_enrich <- gene_kegg_org %>%
+  dplyr::filter(!is.na(l2fc), pval <= 0.05) %>%
+  dplyr::select(entrezgene_id)
+kegg <- enrichKEGG(gene         = genes_enrich$entrezgene_id,
+                   universe     = gene_kegg_org$entrezgene_id,
+                   organism     = org_kegg_code, 
+                   keyType      = "kegg", 
+                   pvalueCutoff = 0.05)
+
+
+# KEGG table
+median.FC.values <- vector(mode="list", nrow(kegg@result))
+combined.pvalues <- vector(mode="list", nrow(kegg@result))
+kegg.annotations <- strsplit(kegg@result$geneID, "/")
+for (DEGene in gene_kegg_org$entrezgene_id[!is.na(gene_kegg_org$l2fc)]) {
+  indices <- kegg.annotations %>%
+    lapply(., function(x) DEGene %in% x) %>% 
+    unlist() %>% 
+    which()
+  log.FCs <- gene_kegg_org$l2fc[match(DEGene, gene_kegg_org$entrezgene_id)]
+  pvalues <- gene_kegg_org$pval[match(DEGene, gene_kegg_org$entrezgene_id)]
+  median.FC.values[indices] <- mapply("c", median.FC.values[indices], log.FCs, SIMPLIFY = FALSE) 
+  combined.pvalues[indices] <- mapply("c", combined.pvalues[indices], pvalues, SIMPLIFY = FALSE)
+}
+median.FC.values <- lapply(median.FC.values, median) %>% unlist()
+combined.pvalues <- lapply(combined.pvalues, fisher) %>% unlist()
+plot.kegg <- kegg@result %>%
+  tibble::rownames_to_column(var = "pathway") %>%
+  dplyr::select(-geneID) %>%
+  dplyr::mutate(
+    id      = stringr::str_remove(rownames(kegg@result), org_kegg_code),
+    log.FCs = median.FC.values,
+    p.genes = combined.pvalues,
+    name    = kegg_category$name[match(id, kegg_category$id)])
+plot.kegg$Description <- stringr::str_remove_all(plot.kegg$Description, pattern = pattern_kegg)
+```
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE, fig.width=8}
+### Dotplot
+sub.kegg <- plot.kegg %>% dplyr::filter(p.adjust <= 0.05, !is.na(name))
+ggplot(sub.kegg,
+       aes(x = log.FCs,
+           y = reorder(name, log.FCs),
+           color = log.FCs,
+           size  = Count)) +
+  geom_point() +
+  scale_color_gradient2(
+    name = "log2(Fold change)",
+    low    = "green3", 
+    mid    = "lightyellow2", 
+    high   = "tomato",
+    midpoint = mean(sub.kegg$log.FCs)) +
+  scale_size(name = "DEG count") +
+  ggpubr::theme_cleveland() +
+  theme(panel.background = element_blank()) +
+  ggtitle("Enriched KEGG pathways") +
+  xlab("log2(Fold change)")
+```
+
+```{r, fig.width=10, message=FALSE, warning=FALSE, echo=FALSE, include = FALSE}
+### Pathway networks
+pts <- pairwise_termsim(kegg)
+pts@result$Description  <- stringr::str_remove_all(pts@result$Description,  pattern = pattern_kegg)
+rownames(pts@termsim)   <- stringr::str_remove_all(rownames(pts@termsim),   pattern = pattern_kegg)
+colnames(pts@termsim)   <- stringr::str_remove_all(colnames(pts@termsim),   pattern = pattern_kegg)
+kegg@result$Description <- stringr::str_remove_all(kegg@result$Description, pattern = pattern_kegg)
+
+emapplot(pts)
+```
+
+```{r, fig.width=10, message=FALSE, warning=FALSE, echo=FALSE, include =FALSE}
+### Pathway dendrograms
+treeplot(pts)
+```
+
+```{r, fig.width=10, message=FALSE, warning=FALSE, echo=FALSE, include = FALSE}
+### Pathway-genes networks
+DEG_org <- gene_kegg_org[!is.na(gene_kegg_org$l2fc),]
+ord.lfc <- order(-DEG_org$l2fc)
+ord.gen <- setNames(DEG_org$l2fc[ord.lfc], DEG_org$entrezgene_id[ord.lfc])
+
+cnetplot(kegg, 
+         layout            = "fr",
+         categorySize      = "pvalue", 
+         color.params      = list(foldChange = ord.gen),
+         vertex.label.font = 6,
+         node_label        = "category") +
+  scale_color_gradient2(name = 'log2FC', 
+                        low  = 'skyblue4', 
+                        high = 'tomato4')
+```
+*This figure presents the results of a KEGG enrichment analysis performed with the clusterProfiler package. It only shows significant KEGG pathways and ignores the others*
+ 
+### GAGE analysis
+```{r, message=FALSE, warning=FALSE, echo=FALSE, fig.width=10, fig.height=7}
+kegg_orgMap <- kegg.gsets(species = org_kegg_code, id.type = "kegg")
+kegg.gs     <- kegg_orgMap$kg.sets[kegg_orgMap$sigmet.idx]
+keggres     <- gage(ord.gen, gsets = kegg.gs, same.dir = T)
+
+kegg.terms <- rbind.data.frame(
+  keggres$greater %>% 
+    as.data.frame() %>%
+    tibble::rownames_to_column(var = "pathway") %>%
+    dplyr::filter(!is.na(p.geomean)) %>%
+    dplyr::mutate(direction = "up-regulated"),
+  keggres$less %>% 
+    as.data.frame() %>%
+    tibble::rownames_to_column(var = "pathway") %>%
+    dplyr::filter(!is.na(p.geomean)) %>%
+    dplyr::mutate(direction = "down-regulated")) %>%
+  dplyr::mutate(pathway_id = stringr::str_extract(pathway, pattern = "[a-z]{3}[0-9]{5}"),
+                pathway_name = stringr::str_remove(pathway, pattern = "[a-z]{3}[0-9]{5} ")) %>%
+  dplyr::group_by(pathway_id) %>%
+  dplyr::arrange(q.val) %>%
+  dplyr::filter(row_number() == 1) %>%
+  dplyr::ungroup()
+
+ggplot(kegg.terms,
+       aes(x = q.val,
+           y = reorder(pathway_name, stat.mean),
+           size = set.size,
+           color = stat.mean)) +
+  geom_vline(xintercept = 0.1, color = "darkred", lty = "dotted") +
+  geom_point() +
+  scale_size(name = "Gene-set size") +
+  scale_color_gradient2(name = "Gene-set level change",
+                        low = "skyblue2",
+                        high = "tomato3",
+                        mid = "lightyellow2",
+                        midpoint = median(kegg.terms$stat.mean)) +
+  ylab("") + xlab("Adjusted p-value (FDR)") +
+  ggthemes::theme_few()
+```
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE, include=FALSE}
+# Pathway visualization using KEGG online
+#sel_up      <- keggres$greater[, "q.val"] <= 0.05 & !is.na(keggres$greater[, "q.val"])
+#sel_up      <- keggres$less[, "q.val"] <= 0.05 & !is.na(keggres$less[, "q.val"])
+#path_ids_up <- rownames(keggres$greater)[sel_up]
+#keggresids  <- substr(path_ids_up, start = 1, stop = 8)
+#kegg.dir <- getwd() %>% dirname() %>% paste0("/outputs/KEGG_pathways")
+#pathview(gene.data   = ord.gen, 
+#         pathway.id  = keggresids, 
+#         species     = org_kegg_code,
+#         kegg.native = TRUE,
+#         same.layer  = FALSE,
+#         kegg.dir    = kegg.dir)
+```
+*This figure presents the results of a KEGG enrichment analysis performed with the gage package. It shows all KEGG pathways, even the non-significant ones. Results should be very similar to what is presented before, but differences may occur due to differences in KEGG databases.*
+ 
+ 
+ 
+## 4. Annotations weaknesses
+ 
+Even though Oryzias latipes is the species allowing the most exhaustive mapping of genes of Sparus aurata, almost 50% of the genes we try to map still do not find correspondence in the KEGG-supported organisms genomes. In addition, several of the homologous genes in Oryzias latipes are deemed low-quality homologs of Sparus aurata, suggesting that some of them may not share the same functions between the two species. 
+ 
+In an effort to look for a KEGG-supported species which covers Sparus aurata genome well but also has reliable homologous genes, I checked how all the differentially expressed genes in our dataset map on the different KEGG-supported organisms. Out of `r length(unique(DEGs$gene))` differentially expressed genes of Sparus aurata, `r length(unique(best_homologs$source_geneID))` found reliable homologous genes in various KEGG-supported species.
+ 
+### 4.1. Species contributing to the annotations
+```{r, fig.height = 7, echo=FALSE, warning=FALSE}
+ggplot(best_species,
+       aes(x = reorder(target_scientific_name, species_rank),
+           y = species_score,
+           alpha = (target_scientific_name %in% best_homologs$target_scientific_name))) +
+  geom_point() +
+  ggpubr::theme_cleveland() +
+  ggtitle("Species usefulness for homologous genes mapping") +
+  scale_alpha_manual(breaks = c(TRUE, FALSE),
+                     values = c(1, .3),
+                     name   = "Contains high quality homologous genes") +
+  scale_x_discrete(breaks = best_species$target_scientific_name[best_species$target_scientific_name %in% best_homologs$target_scientific_name],
+                   labels = best_species$target_scientific_name[best_species$target_scientific_name %in% best_homologs$target_scientific_name]) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        axis.title  = element_blank(),
+        legend.position = "bottom",
+        panel.background = element_blank())
+```
+*This figure presents the contributions of each KEGG-supported species to the annotations of Sparus aurata genes. It differs from the previous graph because we only retained homologs with high quality and removed low-quality ones. As a result, Seriola dumerili becomes the best species to map Sparus aurata genes onto.*
+ 
+ 
+### 4.2. Distribution of best homologous genes across species {.tabset}
+ 
+When isolating the genes of interest (i.e., differentially expressed genes) and we look for the best homologous genes across all species carrying a known homolog, `r homolog_genes1$target_scientific_name[match(best_species$target_scientific_name[best_species$species_rank==1], homolog_genes1$target_species)]` appears to carry most of them. It is also KEGG-supported, meaning a KEGG-analysis on this species rather than on Danio rerio is more likely to show meaningful pathways. 
+(The heatmap and the sankey plot both show the same result.)
+ 
+#### Heatmap
+```{r, echo=FALSE, warning=FALSE, include=FALSE}
+makeRects <- function(tfMat, border, dims){
+  
+  indexe = (tfMat$genes_heatLoc-1)*dims[2] + (tfMat$target_heatLoc+1)
+  cAbove = expand.grid(1:dims[2], 1:dims[1])[indexe,]
+  
+  xl = cAbove[,1] - 0.49
+  yb = cAbove[,2] - 0.49
+  xr = cAbove[,1] + 0.49
+  yt = cAbove[,2] + 0.49
+  
+  rect(xl, yb, xr, yt, border = border, lwd = 3)
+  
+}
+
+heat.data <- homolog_genes2 %>%
+  dplyr::select(any_of(sp.key$species_code[match(best_species$target_scientific_name, sp.key$species_name)])) %>%
+  dplyr::filter(rownames(.) %in% DEGs$geneName) %>%
+  as.matrix() %>%
+  scale()
+
+invisible(
+  capture.output(
+    heat.map <- heatmap(heat.data)
+  )
+)
+key.coord <- list(
+  data.frame(
+    genes.nam = rownames(heat.data)[heat.map$rowInd],
+    genes.loc = c(1:length(heat.map$rowInd))),
+  data.frame(
+    speci.nam = colnames(heat.data)[heat.map$colInd],
+    speci.loc = c(1:length(heat.map$colInd))))
+
+cells <- best_homologs %>% 
+  dplyr::select(target_species, source_geneName) %>%
+  dplyr::filter(source_geneName %in% DEGs$geneName) %>%
+  dplyr::mutate(target_heatLoc = key.coord[[2]]$speci.loc[match(target_species,  key.coord[[2]]$speci.nam)],
+                genes_heatLoc  = key.coord[[1]]$genes.loc[match(source_geneName, key.coord[[1]]$genes.nam)])
+```
+
+```{r, echo=FALSE, fig.width=10, fig.height=7, warning=FALSE, message=FALSE}
+library("RColorBrewer")
+col <- colorRampPalette(brewer.pal(10, "Blues"))(256)
+heatmap(heat.data, col = col, add.expr = {
+  makeRects(cells, "red", dims = dim(heat.data))
+})
+```
+*These figures show how the best homologous genes to the Sparus aurata genes we want to annotate are distributed across KEGG-supported organisms. Again, Seriola dumerili comes up on top.*
+ 
+#### Sankey plot
+```{r, echo=FALSE, fig.width=10, fig.height=7, warning=FALSE, message=FALSE}
+One_homolog <- best_homologs %>%
+  dplyr::filter(source_geneID %in% DEGs$gene) %>%
+  dplyr::group_by(source_geneID) %>%
+  dplyr::arrange(perc.id, goc_score) %>%
+  dplyr::filter(row_number() == 1) %>%
+  dplyr::ungroup() %>%
+  dplyr::mutate(Differentially_expressed = ifelse(source_geneID %in% DEGs$gene[DEGs$padj<=0.05], "DEG", NA),
+                Regulation = ifelse(source_geneID %in% DEGs$gene[DEGs$padj<=0.05 & DEGs$log2FoldChange>0], "UP", 
+                             ifelse(source_geneID %in% DEGs$gene[DEGs$padj<=0.05 & DEGs$log2FoldChange<0], "DOWN", NA))) %>%
+  ggsankey::make_long(Differentially_expressed, 
+                      Regulation, 
+                      target_scientific_name)
+
+labs.x <- c("Differentially\nexpressed genes", 
+            "Up or Down\nregulated", 
+            "Kegg-supported\norganism")
+ggplot(One_homolog, 
+       aes(x = x, 
+          next_x = next_x, 
+          node = node, 
+          next_node = next_node,
+          fill = factor(node),
+          label = node)) +
+  ggsankey::geom_sankey(flow.alpha = 0.5, node.color = 1) +
+  ggsankey::geom_sankey_label(size = 3.5, color = 1, fill = "white") +
+  ggsankey::theme_sankey(base_size = 16) +
+  scale_fill_viridis_d(na.value = "grey40") +
+  scale_x_discrete(breaks = unique(One_homolog$x),
+                   labels = labs.x) +
+  xlab("") +
+  theme(legend.position = "none")
+```
+*These figures show how the best homologous genes to the Sparus aurata genes we want to annotate are distributed across KEGG-supported organisms. Again, Seriola dumerili comes up on top.*
+ 
+ 
+ 
+### 4.3. Residual unmapped genes
+ 
+Regardless of which species we use for the KEGG annotations, a substantial amount of our genes are left out of the analysis. Hence, instead of looking for only one KEGG-supported species that shares many homologous genes with Sparus aurata, I annotate the differentially expressed genes using multiple KEGG-supported organisms.
+
+```{r, fig.height=7, fig.width=7, echo=FALSE, warning=FALSE}
+One_homolog <- KO_annot %>%
+  dplyr::group_by(saurata_ensembl_geneID) %>%
+  dplyr::arrange(homolog_confidence, homolog_perc_id, homolog_goc_score) %>%
+  #dplyr::filter(row_number() == 1) %>%
+  dplyr::ungroup() %>%
+  ggsankey::make_long(Differentially_expressed, 
+                      Regulation, 
+                      homolog_kegg_organism)
+
+labs.x <- c("Differentially\nexpressed genes", 
+            "Up or Down\nregulated", 
+            "Kegg-supported\norganism")
+ggplot(One_homolog, 
+       aes(x = x, 
+          next_x = next_x, 
+          node = node, 
+          next_node = next_node,
+          fill = factor(node),
+          label = node)) +
+  ggsankey::geom_sankey(flow.alpha = 0.5, node.color = 1) +
+  ggsankey::geom_sankey_label(size = 3.5, color = 1, fill = "white") +
+  ggsankey::theme_sankey(base_size = 16) +
+  scale_fill_viridis_d(na.value = "grey40") +
+  scale_x_discrete(breaks = unique(One_homolog$x),
+                   labels = labs.x) +
+  xlab("") + ylab("") +
+  theme(legend.position = "none")
+```
+*This figure shows the distribution of the best homologous genes to Sparus aurata genes which also carry a KEGG annotations. Before we only picked the KEGG-supported organisms which had high-quality homologs to Sparus aurata genes and sorted them so that the best species would show. But not all the genes actually carry a KEGG annotation. Here we see the part of Sparus aurata genes which cannot be annotated AT ALL.*
+ 
+ 
+ 
+## 5. Final KEGG annotations
+  
+Two strategies are possible at this stage: 1) we can perform a classic KEGG-enrichment analysis on Seriola dumerili and sacrifice some of our genes of interest in the process, or 2) we can try to annotate as much of the Sparus aurata genes onto multiple species and run a custom enrichment analysis.
+ 
+### 5.a. Strategy 1: Multi-species KEGG analysis
+ 
+For all the known homologous genes found for Sparus aurata, I check if there is a KEGG annotation available in the KEGG database. For each gene of Sparus aurata we want to annotate, several homologous genes have similar (if not identical) quality which means we must choose one over the others to include in the custom KEGG-analysis. If we were to keep them all, we would bias the test towards these genes. I make the decision that if two homologs are ex-aequo in terms of quality, I pick the homolog which species ranked higher in part 2.
+ 
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=10}
+k.o <- KO_annot %>%
+  dplyr::group_by(saurata_ensembl_geneID) %>%
+  dplyr::arrange(homolog_perc_id, homolog_goc_score) %>%
+  dplyr::filter(row_number() == ifelse("sdumerili" %in% homolog_kegg_organism, match("sdumerili", homolog_kegg_organism), 1)) %>%
+  dplyr::ungroup()
+```
+ 
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=10}
+geneList  <- setNames(k.o$DEG_log2_FC, k.o$saurata_ensembl_geneID) %>% sort(decreasing = TRUE)
+TERM2GENE <- data.frame(TERM = k.o$KEGG_Pathway_name, GENE = k.o$saurata_ensembl_geneID)
+
+gsea.custom <- GSEA(geneList, TERM2GENE = TERM2GENE)
+gseaplot2(gsea.custom, 
+          geneSetID = c(1:nrow(summary(gsea.custom))), 
+          pvalue_table = FALSE,
+          color = palette.colors(n = nrow(gsea.custom@result), palette = palette.pals()[2]), 
+          ES_geom = "dot")
+
+summary(gsea.custom) %>% dplyr::select(-Description)
+```
+*These results show the KEGG categories which are returned when annotating Sparus aurata genes with multiple species homologs. The results are not more precise than what has been observed when mapping Sparus aurata genes onto Danio rerio or Oryzias latipes.*
+ 
+ 
+### 5.b. Strategy 2: KEGG-analysis on Seriola dumerili
+ 
+Although the multi-species analysis is a nice approach, it is experimental and needs to be 1) stabilized, and 2) benchmarked. Until the algorithm is refined, I am also using the classic KEGG analysis on Seriola dumerili. The vertical red dashed line shows the statistical significance of alpha = 0.05 whereas the vertical red dotted line shows the statistical significance of alpha = 0.1.
+ 
+```{r, message=FALSE, warning=FALSE, echo=FALSE, fig.width=10, fig.height=7}
+ord.gen <- setNames(KO_annot$DEG_log2_FC[KO_annot$homolog_kegg_organism=="sdumerili"],
+                    KO_annot$homolog_entrez_geneID[KO_annot$homolog_kegg_organism=="sdumerili"])
+ord.gen <- sort(ord.gen)
+kegg_orgMap <- kegg.gsets(species = "sdu", id.type = "kegg")
+kegg.gs     <- kegg_orgMap$kg.sets[kegg_orgMap$sigmet.idx]
+keggres     <- gage(ord.gen, gsets = kegg.gs, same.dir = T)
+
+kegg.terms <- rbind.data.frame(
+  keggres$greater %>% 
+    as.data.frame() %>%
+    tibble::rownames_to_column(var = "pathway") %>%
+    dplyr::filter(!is.na(p.geomean)) %>%
+    dplyr::mutate(direction = "up-regulated"),
+  keggres$less %>% 
+    as.data.frame() %>%
+    tibble::rownames_to_column(var = "pathway") %>%
+    dplyr::filter(!is.na(p.geomean)) %>%
+    dplyr::mutate(direction = "down-regulated")) %>%
+  dplyr::mutate(pathway_id = stringr::str_extract(pathway, pattern = "[a-z]{3}[0-9]{5}"),
+                pathway_name = stringr::str_remove(pathway, pattern = "[a-z]{3}[0-9]{5} ")) %>%
+  dplyr::group_by(pathway_id) %>%
+  dplyr::arrange(q.val) %>%
+  dplyr::filter(row_number() == 1) %>%
+  dplyr::ungroup()
+
+ggplot(kegg.terms,
+       aes(x = q.val,
+           y = reorder(pathway_name, stat.mean),
+           size = set.size,
+           color = stat.mean)) +
+  geom_vline(xintercept = 0.1, color = "darkred", lty = "dotted") +
+  geom_vline(xintercept = 0.05, color = "darkred", lty = "dashed") +
+  geom_point() +
+  scale_size(name = "Gene-set size") +
+  scale_color_gradient2(name = "Gene-set level change",
+                        low = "skyblue2",
+                        high = "tomato3",
+                        mid = "lightyellow2",
+                        midpoint = median(kegg.terms$stat.mean)) +
+  ylab("") + xlab("Adjusted p-value (FDR)") +
+  ggthemes::theme_few()
+```
+ 
+```{r, message=FALSE, warning=FALSE, echo=FALSE, include=FALSE}
+# Pathway visualization using KEGG online
+#sel_up      <- keggres$greater[, "q.val"] < 0.05 & !is.na(keggres$greater[, "q.val"])
+#path_ids_up <- rownames(keggres$greater)[sel_up]
+#keggresids  <- substr(path_ids_up, start = 1, stop = 8)
+#kegg.dir <- getwd() %>% dirname() %>% paste0("/outputs/KEGG_pathways")
+#pathview(gene.data   = ord.gen, 
+#         pathway.id  = keggresids, 
+#         species     = org_kegg_code,
+#         kegg.native = TRUE,
+#         same.layer  = FALSE,
+#         kegg.dir    = kegg.dir)
+```
+*This figure shows the results of a KEGG enrichment analysis performed with the gage package on Seriola dumerili.*
+ 
+Selecting for the KEGG-supported organism with the most robust functional homologs to Sparus aurata genes (i.e., Seriola dumerili) shows similar results to other KEGG analyses (up-regulated ribosome, oxydative phosphorylation, ECM-receptor activity, cardiac muscle contraction)
+ 
+It also highlights the downregulation of the **Wnt signalling pathway** at the level (alpha = 0.05), which was associated with fish masculinization in the literature. Genes differentially expressed on our dataset relating to this pathway are: `r paste0(unique(KO_annot$saurata_external_name[which(KO_annot$KEGG_Pathway_ID=="sdu04310")]), collapse = ", ")` plus some uncharacterized locis `r KO_annot$saurata_ensembl_geneID[which(KO_annot$KEGG_Pathway_ID=="sdu04310" & KO_annot$saurata_external_name=="")]`.
+ 
+There is ***weak evidence (alpha = 0.1)***, that pathways such as **Oocyte meiosis**, **Progesterone-mediated oocyte maturation**, and **Cellular senescence** are also down-regulated during the development of Sparus aurata gonads. Genes involved in thes pathways are:
+ 
+**Oocyte meiosis**: `r paste0(unique(KO_annot$saurata_external_name[which(KO_annot$KEGG_Pathway_ID=="sdu04114")]), collapse = ", ")` plus some uncharacterized locis `r KO_annot$saurata_ensembl_geneID[which(KO_annot$KEGG_Pathway_ID=="sdu04114" & KO_annot$saurata_external_name=="")]`
+ 
+**Progesterone-mediated oocyte maturation**: `r paste0(unique(KO_annot$saurata_external_name[which(KO_annot$KEGG_Pathway_ID=="sdu04914")]), collapse = ", ")` plus some uncharacterized locis `r KO_annot$saurata_ensembl_geneID[which(KO_annot$KEGG_Pathway_ID=="sdu04914" & KO_annot$saurata_external_name=="")]`
+ 
+**Cellular senescence**: `r paste0(unique(KO_annot$saurata_external_name[which(KO_annot$KEGG_Pathway_ID=="sdu04218")]), collapse = ", ")` plus some uncharacterized locis `r KO_annot$saurata_ensembl_geneID[which(KO_annot$KEGG_Pathway_ID=="sdu04218" & KO_annot$saurata_external_name=="")]`
+ 
+
+
+
+## 6. Guilty by association {.tabset}
+ 
+To verify the relevance of the genes found in the KEGG analysis, I search databases of gene co-expression and interaction and cross these data with modules of co-expression found in our dataset. The goal is to find if 1) *specific differentially expressed genes* or 2) *groups of genes which co-express in our dataset* are also known to interact or co-express with *genes known to affect sex-determination in other fish species*. In other words, we want to know if the genes in our dataset (and the ones found in the KEGG analyses) have known association with sex-determination genes.
+ 
+The first dataset I scanned was the GENEMANIA database. It is easier to work with than other SQL-based databases. However, its content was passed into the private domain in 2015 and it has not been updated since 2013. So although known associations are unlikely to be disproved, it lacks new associations that were documented these passed 10 years or so. It also only works on model organisms which forces us to work with Danio rerio genes.
+ 
+ 
+### 6.a. Documented co-expression
+ 
+Here you see the network of genes from Danio rerio which have known genetic and physical interaction patterns. Each node is a gene and the connections between them mean that they were found to interact or co-express in some context. If the node is blue, it means this gene was found to be down-regulated in our dataset for Sparus aurata. If the node is in red, the gene was up-regulated. If the node is in grey, it was neither up nor down regulated, or was not part of our dataset to begin with.
+ 
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=7, fig.height=7}
+keys <- saurata_drerio_key
+keys$homolog_associated_gene_name[keys$homolog_associated_gene_name==""] <- NA
+gens <- keys$homolog_ensembl_gene[!is.na(keys$l2fc)]
+net1 <- readRDS(getwd() %>% dirname() %>% paste0(., "/data/seaBream_coExpressionNetworks_SpidermiR.rds"))
+upregulated   <- unique(keys$homolog_ensembl_gene[match(DEGs$gene[DEGs$log2FoldChange>0], keys$ensembl_gene_id)])
+downregulated <- unique(keys$homolog_ensembl_gene[match(DEGs$gene[DEGs$log2FoldChange<0], keys$ensembl_gene_id)])
+modules <- modules %>% dplyr::mutate(homolog_GeneID = keys$homolog_associated_gene_name[match(GeneId, keys$ensembl_gene_id)])
+
+kegg_sus0 <- unique(KO_annot$saurata_ensembl_geneID[which(KO_annot$KEGG_Pathway_ID %in% c("sdu04310", 'sdu04114', 'sdu04914'))])
+kegg_sus1 <- kegg_sus0[which(!(kegg_sus0 %in% DEGs$gene))]
+known_genes  <- c("wnt4", "wnt10a", "sox32", "sox9", "amh", "foxl2", "cyp19a1a", "oxr1", "dmrt1", "dmrt2", 
+                  "bdnf", "hsd17b4", "hsd11b2", "lepa", "lhcgr", "fshb", "bik", "ogdhb",
+                  "dio", "lhb", "foxh1", "igf", "gnrh2", "gnrh3", "ptges3a", "ptgr1", kegg_sus1)
+
+known_genes   <- keys$homolog_ensembl_gene[which(keys$homolog_associated_gene_name %in% known_genes)]
+kegg_suspects <- keys$homolog_ensembl_gene[which(keys$ensembl_gene_id %in% kegg_sus0)]
+
+## Literature
+grap <- net1 %>%
+  dplyr::mutate(from = keys$homolog_ensembl_gene[match(Gene_A, keys$homolog_ensembl_gene)],
+                to   = keys$homolog_ensembl_gene[match(Gene_B, keys$homolog_ensembl_gene)]) %>%
+  #dplyr::mutate(from = keys$homolog_associated_gene_name[match(Gene_A, keys$homolog_ensembl_gene)],
+  #              to   = keys$homolog_associated_gene_name[match(Gene_B, keys$homolog_ensembl_gene)]) %>%
+  dplyr::select(from, to, weight) %>%
+  dplyr::distinct(from, to, .keep_all = TRUE) %>%
+  dplyr::filter(!is.na(from), !is.na(to)) %>%
+  igraph::graph_from_data_frame(., directed = FALSE) %>%
+  igraph::simplify()
+nodes_to_keep <- which(names(igraph::V(grap)) %in% c(upregulated, downregulated, known_genes))
+egonet <- induced_subgraph(grap, c(nodes_to_keep, neighbors(grap, v = nodes_to_keep)))
+
+visGrap <- egonet %>% 
+  igraph::delete_edges(which(E(.)$weight <= quantile(E(.)$weight, 0.9))) %>% 
+  igraph::delete_vertices(which(igraph::degree(.)==0)) %>%
+  visNetwork::toVisNetworkData()
+nodes <- visGrap$nodes %>%
+  dplyr::filter(id != "NA") %>%
+  dplyr::mutate(label = dplyr::coalesce(keys$homolog_associated_gene_name[match(id, keys$homolog_ensembl_gene)], id),
+                color = ifelse(id %in% upregulated,   "#EE9C77",
+                        ifelse(id %in% downregulated, "#087CA7", "#D3D3D3")),
+                group = modules$Module[match(id, modules$homolog_GeneID)])
+edges <- visGrap$edges %>%
+  dplyr::filter(from != "NA", to != "NA")
+
+visNetwork::visNetwork(nodes, edges) %>%
+  visNetwork::visOptions(highlightNearest = TRUE) %>%
+  visNetwork::visIgraphLayout(physics = FALSE, "layout_with_kk")
+```
+ 
+ 
+### 6.b. Experimental co-expression
+ 
+Here I plot the network of co-expression between the genes of Sparus aurata in our dataset. The network was built using the WGCNA method in R. The technique has its weaknesses, but it is widely used in the field of transcriptomics. Again, genes in blue are down-regulated during gonad development, genes in red are up-regulated during gonad development, genes in grey were not differentially expressed (I remove most of them for clarity). 
+ 
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=7, fig.height=7}
+# Fine-scale co-expression from WGCNA TOM matrix
+colnames(TOM) <- rownames(TOM) <- saurata_drerio_key$homolog_ensembl_gene[match(colnames(TOM), saurata_drerio_key$ensembl_gene_id)]
+TOM1 <- TOM[!is.na(rownames(TOM)), !is.na(colnames(TOM))]
+TOM1 <- TOM1[rownames(TOM1)!="", colnames(TOM1)!=""]
+coExpr_graph_TOM <- igraph::graph_from_adjacency_matrix(TOM1, weighted = TRUE, mode = "undirected") %>%
+  igraph::delete_edges(., which(E(.)$weight <= quantile(E(.)$weight, 0.95))) %>%
+  igraph::delete_vertices(which(igraph::degree(.)==0)) %>%
+  igraph::contract(., mapping = factor(V(.)$name), 
+                   vertex.attr.comb = list(name = "first")) %>%
+  igraph::simplify(remove.multiple = TRUE, remove.loops = TRUE)
+
+# Full network from WGCNA modules
+coExpr <- data.frame()
+for (mm in unique(modules$Module)) {
+  coExpr <- rbind.data.frame(
+    coExpr,
+    t(combn(modules$GeneId[modules$Module==mm], 2)))
+}
+coExpr_graph_modules <- coExpr %>% 
+  dplyr::mutate(G1 = saurata_drerio_key$homolog_ensembl_gene[match(V1, saurata_drerio_key$ensembl_gene_id)], 
+                G2 = saurata_drerio_key$homolog_ensembl_gene[match(V2, saurata_drerio_key$ensembl_gene_id)],
+                module = paste0(modules$Module[match(V1, modules$GeneId)], modules$Module[match(V2, modules$GeneId)])) %>%
+  dplyr::filter(G1 != G2, !is.na(G1), !is.na(G2), G1 !="", G2 !="") %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(weight = mean(TOM1[which(rownames(TOM1)==G1), which(colnames(TOM1)==G2)], na.rm = TRUE)) %>%
+  dplyr::ungroup() %>%
+  dplyr::group_by(module) %>%
+  dplyr::filter(weight >= quantile(weight, 0.75)) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(G1, G2, weight) %>%
+  graph_from_data_frame(., directed = FALSE)
+
+coExpr_graph <- igraph::intersection(coExpr_graph_modules, coExpr_graph_modules)
+
+## Co-expression common between experiment and literature
+inter.graph <- igraph::intersection(coExpr_graph, egonet) %>%
+  igraph::delete_vertices(which(igraph::degree(.)==0))
+common <- inter.graph %>% visNetwork::toVisNetworkData()
+common$nodes <- common$nodes %>%
+  dplyr::filter(id != "NA") %>%
+  dplyr::mutate(label = dplyr::coalesce(keys$homolog_associated_gene_name[match(id, keys$homolog_ensembl_gene)], id),
+                color = ifelse(id %in% upregulated,   "#EE9C77",
+                        ifelse(id %in% downregulated, "#087CA7", "#D3D3D3")),
+                group = modules$Module[match(id, modules$homolog_GeneID)])
+
+visNetwork::visNetwork(common$nodes, common$edges) %>%
+  visNetwork::visOptions(highlightNearest = TRUE) %>%
+  visNetwork::visIgraphLayout(physics = FALSE, "layout_with_kk")
+```
+ 
+ 
+### 6.c. Crossed data
+ 
+I crossed known patterns of interaction (GENEMANIA) with the patterns of interaction we found in the network analysis (WGCNA). I also add to the plot **'special genes'**: 1) *the genes involved in the KEGG pathways relating to sex-determination in Seriola dumerili* (indicated as boxes) and 2) genes known to *affect sex-determination in Danio rerio* (indicated as stars). For each one of them, I added how they connect to the differentially expressed genes in the Sparus aurata dataset. This way you can see which Sparus aurata genes are somehow connected to sex-determination genes and how known sex-determining genes co-express with genes in your dataset.For instance, if a red star (or a group of red stars) connect to a group of blue genes in the network, then it means that the down-regulated genes of this cluster are somewhat related to sex-determination in Sparus aurata.
+ 
+Since data were collected from organs during differentiation, it is normal to detect differentially expressed genes which drive symmetry, cell energy production, focal adhesion etc. But if a group of genes somewhat includes many genes from a sex-determining KEGG pathway and connects a lot to genes involved in sex-determination, then it suggests that these genes are involved in sex-determination in your dataset. For instance, **sox32** is down-regulated in the dataset and it connects to **wnt10a** which was also reported in the literature as promoting masculinization in Zebrafish when down-regulated. And **wnt10a** was reported in the literature to co-express with **apoa4a**, an apolipoprotein transporter involved in the accumulation of DHA in female zebrafish ovary devolpment (https://doi.org/10.1016/j.cbpa.2019.04.005). **sox32** also co-express with two clusters of down-regulated genes, one of which carries several genes involved in one of the down-regulated KEGG pathways involved in sex-determination (**ccna**, **ccnb1**, **ccnb2**, **cdc20**). Also, **BDNF**, although not expressed in your samples is known to interact with two genes differentially expressed in Sparus aurata gonads: **larp6a** (down-regulated) which is required for adequate oocyte development in Danio rerio (https://doi.org/10.1242/dev.187385). **ogbhd** co-expresses with dmrt1 in zebrafish, and **bik** is involved in poor breeding performances in guilthead seabream. Both co-express with a cluster of up-regulated ribosomal genes.
+
+
+
+The networks are interactive, dig around to see if some of the genes there are familiar to you, or if any association seems relevant.
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=7, fig.height=7}
+## Extended common network
+#nodes_to_add <- which(stringr::str_detect(names(igraph::V(grap)), "wnt5b|wnt10a|sox32|dmrt1|bdnf|hsd17b4"))
+#addon <- grap %>% igraph::induced_subgraph(., c(nodes_to_add, neighbors(., v = nodes_to_add)))
+#nodes_to_add   <- which(stringr::str_detect(names(igraph::V(grap)), paste0(known_genes[known_genes!=""], collapse = "|")))
+#addon          <- grap %>% igraph::induced_subgraph(., c(nodes_to_add))
+
+#ggg <- inter.extended <- igraph::union(
+#  inter.graph %>%
+#    igraph::delete_edge_attr(., "weight_1") %>%
+#    igraph::delete_edge_attr(., "weight_2"), 
+#  addon, byname = TRUE) # drops attributes not in common, renames others
+# ext <- igraph::union(grap, coExpr_graph) 
+# igraph::edge_attr(ext, name = "weights") <- dplyr::coalesce(E(ext)$weight,   E(ext)$weight_1)
+# igraph::edge_attr(ggg, name = "weights") <- dplyr::coalesce(E(ggg)$weight_2, E(ggg)$weight_1)
+#                 
+# interesting_isolates <- union(names(which(igraph::degree(inter.extended)==0)), names(V(addon)))
+# paths_to_known_genes <- ext %>%
+#   igraph::delete_edge_attr(., "weight") %>%
+#   igraph::delete_edge_attr(., "weight_1") %>%
+#   igraph::delete_edge_attr(., "weight_2") %>%
+#   igraph::distances(., v = interesting_isolates, weights = E(.)$weights, mode = "all") %>%
+#   t() %>% as.data.frame() %>%
+#   tibble::rownames_to_column("to") %>%
+#   dplyr::filter(to %in% names(V(inter.extended))) %>%
+#   tidyr::pivot_longer(cols = c(2:ncol(.)), names_to = "from", values_to = "path_length") %>%
+#   dplyr::filter(from != to) %>%
+#   dplyr::mutate(module = modules$Module[match(to, modules$homolog_GeneID)]) %>%
+#   dplyr::mutate(module = ifelse(is.na(module), "extended", module)) %>%
+#   dplyr::group_by(from) %>%
+#   dplyr::arrange(path_length) %>%
+#   dplyr::filter(row_number()<=5, path_length<=3) %>%
+#   dplyr::ungroup() %>%
+#   dplyr::distinct()
+
+# ggg <- ggg %>%
+#     igraph::delete_edge_attr(., "weight_1") %>%
+#     igraph::delete_edge_attr(., "weight_2")
+#   
+# for (sp in 1:nrow(paths_to_known_genes)) {
+#   
+#   pat <- ext %>% 
+#     igraph::shortest_paths(., 
+#       from = paths_to_known_genes$from[sp], 
+#       to = paths_to_known_genes$to[sp], 
+#       weights = E(.)$weights, 
+#       mode = "all",
+#       output = "both")
+#   
+#   sub <- ext %>% 
+#     igraph::delete_edges(., edges = which(!(E(ext) %in% pat$epath[[1]]))) %>%
+#     igraph::delete_vertices(., v = which(!(V(ext) %in% pat$vpath[[1]]))) %>%
+#     igraph::delete_edge_attr(., "weight") %>%
+#     igraph::delete_edge_attr(., "weight_1") %>%
+#     igraph::delete_edge_attr(., "weight_2")
+#   
+#   ggg <- igraph::union(ggg, sub, byname = TRUE) 
+#   igraph::edge_attr(ggg, name = "weights") <- dplyr::coalesce(E(ggg)$weights_2, E(ggg)$weights_1)
+#   ggg <- ggg %>%
+#     igraph::delete_edge_attr(., "weights_1") %>%
+#     igraph::delete_edge_attr(., "weights_2")
+#   
+# } 
+# 
+# com <- igraph::cluster_fast_greedy(ggg, weights = E(ggg)$weights)
+# mem <- igraph::membership(com)
+# 
+# common.extended <- ggg %>% visNetwork::toVisNetworkData()
+# common.extended$nodes <- common.extended$nodes %>%
+#   dplyr::filter(id != "") %>%
+#   dplyr::mutate(group = ifelse(id %in% kegg_sus0, "kegg suspiscions",
+#                         ifelse(id %in% names(igraph::V(grap))[nodes_to_add], "target", "non-target")),
+#                 color = ifelse(id %in% upregulated,   "#EE9C77",
+#                         ifelse(id %in% downregulated, "#087CA7",
+#                         ifelse(group %in% c("target", "kegg suspiscions"), "darkred", "#D3D3D3"))),
+#                 community = unname(mem[match(id, names(mem))]))
+# common.extended$edges <- common.extended$edges %>%
+#   dplyr::filter(from!=to, from!="", to!="")
+# 
+# visNetwork::visNetwork(common.extended$nodes, common.extended$edges) %>%
+#   visNetwork::visOptions(highlightNearest = list(enabled = TRUE, degree = 1),
+#                          selectedBy       = "community") %>%
+#   visNetwork::visIgraphLayout(physics = FALSE, "layout_nicely") %>%
+#   visNetwork::visGroups(groupname = "target",           shape = "star") %>%
+#   visNetwork::visGroups(groupname = "kegg suspiscions", shape = "box")
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, fig.width=7, fig.height=7}
+nodes_to_add   <- which(stringr::str_detect(names(igraph::V(grap)), paste0(known_genes[known_genes!=""], collapse = "|")))
+addon          <- grap %>% igraph::induced_subgraph(., c(nodes_to_add))
+
+ggg <- inter.extended <- igraph::union(coExpr_graph, addon, byname = TRUE) # drops attributes not in common, renames others
+ext <- igraph::union(grap, coExpr_graph) 
+igraph::edge_attr(ext, name = "weights") <- dplyr::coalesce(E(ext)$weight, E(ext)$weight_1)
+igraph::edge_attr(ggg, name = "weights") <- dplyr::coalesce(E(ggg)$weight, E(ggg)$weight_1)
+                
+interesting_isolates <- union(names(which(igraph::degree(inter.extended)==0)), names(V(addon)))
+paths_to_known_genes <- ext %>%
+  igraph::delete_edge_attr(., "weight") %>%
+  igraph::delete_edge_attr(., "weight_1") %>%
+  igraph::delete_edge_attr(., "weight_2") %>%
+  igraph::distances(., v = interesting_isolates, weights = E(.)$weights, mode = "all") %>%
+  t() %>% as.data.frame() %>%
+  tibble::rownames_to_column("to") %>%
+  dplyr::filter(to %in% names(V(inter.extended))) %>%
+  tidyr::pivot_longer(cols = c(2:ncol(.)), names_to = "from", values_to = "path_length") %>%
+  dplyr::filter(from != to) %>%
+  dplyr::mutate(module = modules$Module[match(to, modules$homolog_GeneID)]) %>%
+  dplyr::mutate(module = ifelse(is.na(module), "extended", module)) %>%
+  dplyr::group_by(from) %>%
+  dplyr::arrange(path_length) %>%
+  dplyr::filter(row_number()<=5 & path_length<=2) %>%
+  dplyr::ungroup() %>%
+  dplyr::distinct()
+
+ggg <- ggg %>%
+  igraph::delete_edge_attr(., "weight") %>%
+  igraph::delete_edge_attr(., "weight_1") %>%
+  igraph::delete_edge_attr(., "weight_2")
+  
+for (sp in 1:nrow(paths_to_known_genes)) {
+  
+  pat <- ext %>% 
+    igraph::shortest_paths(., 
+      from = paths_to_known_genes$from[sp], 
+      to = paths_to_known_genes$to[sp], 
+      weights = E(.)$weights, 
+      mode = "all",
+      output = "both")
+  
+  sub <- ext %>% 
+    igraph::delete_edges(., edges = which(!(E(ext) %in% pat$epath[[1]]))) %>%
+    igraph::delete_vertices(., v = which(!(V(ext) %in% pat$vpath[[1]]))) %>%
+    igraph::delete_edge_attr(., "weight") %>%
+    igraph::delete_edge_attr(., "weight_1") %>%
+    igraph::delete_edge_attr(., "weight_2")
+  
+  ggg <- igraph::union(ggg, sub, byname = TRUE) 
+  igraph::edge_attr(ggg, name = "weights") <- dplyr::coalesce(E(ggg)$weights_2, E(ggg)$weights_1)
+  ggg <- ggg %>%
+    igraph::delete_edge_attr(., "weights_1") %>%
+    igraph::delete_edge_attr(., "weights_2")
+  
+} 
+ggg <- ggg %>% igraph::delete_vertices(., which(names(V(.))==""))
+com <- igraph::simplify(ggg) %>% igraph::cluster_fast_greedy(., weights = E(.)$weights)
+mem <- igraph::membership(com)
+
+common.extended <- ggg %>% visNetwork::toVisNetworkData()
+common.extended$nodes <- common.extended$nodes %>%
+  dplyr::filter(id != "") %>%
+  dplyr::mutate(label = dplyr::coalesce(keys$homolog_associated_gene_name[match(id, keys$homolog_ensembl_gene)], id),
+                group = ifelse(id %in% kegg_suspects, "kegg suspiscions",
+                        ifelse(id %in% names(igraph::V(grap))[nodes_to_add], "target", "non-target")),
+                color = ifelse(group %in% c("target", "kegg suspiscions"), "darkred", 
+                        ifelse(id %in% upregulated,   "#EE9C77",
+                        ifelse(id %in% downregulated, "#087CA7","#D3D3D3"))),
+                community = unname(mem[match(id, names(mem))]))
+common.extended$edges <- common.extended$edges %>%
+  dplyr::filter(from!=to, from!="", to!="")
+
+visNetwork::visNetwork(common.extended$nodes, common.extended$edges) %>%
+  visNetwork::visOptions(highlightNearest = list(enabled = TRUE, degree = 1),
+                         selectedBy       = list(variable = "community", multiple = TRUE)) %>%
+  visNetwork::visIgraphLayout(physics = FALSE, "layout_nicely") %>%
+  visNetwork::visGroups(groupname = "target",           shape = "star") %>%
+  visNetwork::visGroups(groupname = "kegg suspiscions", shape = "box")
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, include=FALSE}
+#lcm <- linkcomm::getLinkCommunities(igraph::as_edgelist(ggg))
+#lcm <- linkcomm::getOCG.clusters(igraph::get.edgelist(ggg))
+#plot(lcm, type = "graph", layout = "spencer.circle")
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, include=FALSE}
+### Additional data mining
+# Nodes and edgs found in the experimental data but not documented in the literature
+#differ <- igraph::difference(coExpr_graph, egonet) %>%
+#  igraph::delete_edges(which(E(.)$weight <= quantile(E(.)$weight, 0.9))) %>% 
+#  igraph::delete_vertices(which(igraph::degree(.)==0)) %>%
+#  igraph::union(., addon)
+#
+#interesting_isolates <- union(names(which(igraph::degree(inter.extended)==0)), names(V(addon)))
+#paths_to_known_genes <- igraph::union(grap, coExpr_graph) %>%
+#  #igraph::delete_edge_attr(., "weight") %>%
+#  igraph::distances(., v = interesting_isolates, weights = NA, mode = "all") %>%
+#  t() %>% as.data.frame() %>%
+#  tibble::rownames_to_column("to") %>%
+#  dplyr::filter(to %in% names(V(differ))) %>%
+#  tidyr::pivot_longer(cols = c(2:ncol(.)), names_to = "from", values_to = "path_length") %>%
+#  dplyr::filter(from != to) %>%
+#  dplyr::mutate(module = modules$Module[match(to, modules$homolog_GeneID)]) %>%
+#  dplyr::mutate(module = ifelse(is.na(module), "extended", module)) %>%
+#  dplyr::group_by(from, module) %>%
+#  dplyr::arrange(path_length) %>%
+#  dplyr::filter(row_number() == 1) %>%
+#  dplyr::ungroup() %>%
+#  dplyr::distinct()
+#
+#ggg <- differ
+#ext <- igraph::union(grap, coExpr_graph)
+#for (sp in 1:nrow(paths_to_known_genes)) {
+#  
+#  pat <- ext %>% 
+#    igraph::shortest_paths(., 
+#      from = paths_to_known_genes$from[sp], 
+#      to = paths_to_known_genes$to[sp], 
+#      weights = NA, 
+#      mode = "all",
+#      output = "both")
+#  
+#  sub <- ext %>% 
+#    igraph::delete_edges(., edges = which(!(E(ext) %in% pat$epath[[1]]))) %>%
+#    igraph::delete_vertices(., v = which(!(V(ext) %in% pat$vpath[[1]])))
+#  
+#  ggg <- igraph::union(ggg, sub)
+#  
+#} 
+#
+#differ.extended <- ggg %>% visNetwork::toVisNetworkData()
+#differ.extended$nodes <- differ.extended$nodes %>%
+#  dplyr::filter(id!="NA", id!="", !is.na(id)) %>%
+#  dplyr::mutate(group = ifelse(id %in% names(igraph::V(grap))[nodes_to_add], "target", "non-target"),
+#                color = ifelse(id %in% upregulated,   "#EE9C77",
+#                        ifelse(id %in% downregulated, "#087CA7", 
+#                        ifelse(group == "target", "red", "#D3D3D3"))))
+#differ.extended$edges <- differ.extended$edges %>% dplyr::filter(!is.na(from), !is.na(to), from!="", to!="")
+#
+#visNetwork::visNetwork(differ.extended$nodes, differ.extended$edges) %>%
+#  visNetwork::visOptions(highlightNearest = list(enabled = TRUE, degree = 2)) %>%
+#  visNetwork::visIgraphLayout(physics = FALSE, "layout_nicely") %>%
+#  visNetwork::visGroups(groupname = "target", color = "red", shape = "star")
+```
+
+```{r, echo=FALSE, warning=FALSE, message=FALSE, include=FALSE}
+## CoExpresDb
+# Known co-expression data
+#my_importer <- coxpresdbr::CoxpresDbAccessor("/Users/bordescamille/Downloads/Dre-u.v22-05.G20344-S11358.combat_pca.subagging.z.d.zip")
+#ensemb_drerio <- saurata_drerio_key$homolog_ensembl_gene[match(DEGs$gene, saurata_drerio_key$ensembl_gene_id)]
+#entrez_drerio <- gene_drerio$entrezgene_id[match(ensemb_drerio, gene_drerio$ensembl_gene_id)]
+#sub_entrez_id <- as.character(entrez_drerio[which(entrez_drerio %in% coxpresdbr::get_source_ids(my_importer))])
+#edges <- coxpresdbr::get_coex_partners(unique(na.omit(sub_entrez_id)), importer = my_importer, n_partners = 10)
+#
+#gra <- igraph::graph_from_data_frame(edges, directed=FALSE)
+```
+
